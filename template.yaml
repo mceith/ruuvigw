@@ -1,0 +1,255 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+
+  Sample SAM Template to decode RuuviTag data sent from RuuviTag Gateway to AWS IoT Core. 
+  There is optional IoT Core Rules to send data to Amazon S3 bucket and Amazon Timestream. 
+
+
+Globals:
+  Function:
+    Timeout: 15
+    Runtime: python3.9
+
+Parameters:
+  Topic:
+    Type: String
+    Default: 'dt/iot/ruuvitags'
+  GatewayTopic:
+    Type: String
+    Default: 'iot/ruuvitags/gateway'
+  MeasureName:
+    Type: String
+    Default: 'ruuvitagdata'
+  Location:
+    Type: String
+    Default: 'Espoo'
+  DeliveryStream:
+    Type: String
+    Default: 'iotcore-to-s3'
+  BucketName:
+    Type: String
+    Default: 'juramwaa'
+  Architecture:
+    Type: String
+    Default: arm64
+    AllowedValues:
+      - arm64
+      - x86_64
+
+Resources:
+
+  RuuviTagsDecodeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: decode/
+      Handler: app.lambda_handler
+      Architectures:
+        - !Ref Architecture
+      Layers:
+        - !Ref RuuviSensorLayer
+      AutoPublishAlias: live
+
+  IoTCoreDecodePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt RuuviTagsDecodeFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: iot.amazonaws.com
+      SourceArn: !GetAtt GWIoTRule.Arn
+
+  RuuviSensorLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      ContentUri: ruuvi_sensor
+      CompatibleRuntimes:
+        - python3.9
+    Metadata:
+      BuildMethod: python3.9
+      BuildArchitecture: !Ref Architecture
+
+  GWIoTRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub 'RuuviGatewayToLambda${AWS::StackName}'
+      TopicRulePayload:
+        RuleDisabled: false
+        Sql: !Sub SELECT aws_lambda("${RuuviTagsDecodeFunction.Arn}", *) as transformed_payload FROM '${GatewayTopic}/#'
+        Actions:
+          - Lambda:
+              FunctionArn: !GetAtt TSMultimeasureFunction.Arn
+          - Republish:
+              Topic: !Ref Topic
+              RoleArn: !GetAtt IoTRepublishRole.Arn
+
+  IoTRepublishRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - iot.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/'
+      Policies:
+        - PolicyName: PublishToIoTCore
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 'iot:Publish'
+                Resource: !Sub 'arn:aws:iot:${AWS::Region}:${AWS::AccountId}:topic/${Topic}'
+
+  Timestream:
+    Type: AWS::Timestream::Database
+    Properties: 
+      DatabaseName: !Sub 'RuuviGateway-${AWS::StackName}'
+
+  TimestreamTable:
+    Type: AWS::Timestream::Table
+    Properties: 
+      DatabaseName: !Ref Timestream
+      TableName: !Sub 'RuuviTag-data-${AWS::StackName}'
+      RetentionProperties:
+        MemoryStoreRetentionPeriodInHours: '1'
+        MagneticStoreRetentionPeriodInDays: '7'
+
+  TimestreamIoTRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub 'RuuvitagsToFirehose${AWS::StackName}'
+      TopicRulePayload:
+        RuleDisabled: false
+        Sql: !Sub SELECT transformed_payload.* FROM '${Topic}'
+        Actions:
+          - Firehose:
+              DeliveryStreamName: !Ref DeliveryStream
+              RoleArn: !GetAtt IoTToTimestreamRole.Arn
+  
+  IoTToTimestreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - iot.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/service-role/'
+      Policies:
+        - PolicyName: 'Firehose-Write-Policy'
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 'firehose:PutRecord'
+                Resource:
+                  - !GetAtt Firehose.Arn
+
+  Firehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Ref DeliveryStream
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub 'arn:aws:s3:::${BucketName}'
+        BufferingHints:
+          SizeInMBs: 128
+          IntervalInSeconds: 600
+        CompressionFormat: UNCOMPRESSED
+        Prefix: iotdata/
+        RoleARN: !GetAtt FirehoseRole.Arn
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt JSONNewlineFunction.Arn
+              Type: Lambda
+ 
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: '/service-role/'
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                  - 'lambda:GetFunctionConfiguration'
+                Resource: 
+                  - !Sub "${JSONNewlineFunction.Arn}"
+              - Effect: Allow
+                Action:
+                  - 's3:AbortMultipartUpload'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:ListBucketMultipartUploads'
+                  - 's3:PutObject'
+                Resource:
+                  - !Sub 'arn:aws:s3:::${BucketName}'
+                  - !Sub 'arn:aws:s3:::${BucketName}/*'
+
+  JSONNewlineFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      CodeUri: jsonnewline/
+      Handler: app.lambda_handler
+      Architectures:
+        - !Ref Architecture
+      AutoPublishAlias: live
+
+  TSMultimeasureFunction:
+    Type: AWS::Serverless::Function # More info about Function Resource: https://github.com/awslabs/serverless-application-model/blob/master/versions/2016-10-31.md#awsserverlessfunction
+    Properties:
+      CodeUri: timestream/
+      Handler: app.lambda_handler
+      Architectures:
+        - !Ref Architecture
+      AutoPublishAlias: live
+      Layers:
+        - !Ref RuuviSensorLayer
+      Environment:
+        Variables:
+          DATABASE_NAME: !Ref Timestream
+          TABLE_NAME: !GetAtt TimestreamTable.Name
+          MEASURE_NAME: !Ref MeasureName
+          LOCATION: !Ref Location
+      Policies:
+      - Statement:
+        - Sid: WriteToTimeStream
+          Effect: Allow
+          Action:
+          - 'timestream:DescribeEndpoints'
+          Resource: '*'
+        - Effect: Allow
+          Action: 'timestream:WriteRecords'
+          Resource: !GetAtt TimestreamTable.Arn
+        
+  IoTCoreInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt TSMultimeasureFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: iot.amazonaws.com
+      SourceArn: !GetAtt GWIoTRule.Arn

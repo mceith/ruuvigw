@@ -1,0 +1,16 @@
+{
+    "data_format": 5, 
+    "humidity": 29.6, 
+    "temperature": 22.94, 
+    "pressure": 999.55, 
+    "acceleration": 1025.4442939526261, 
+    "acceleration_x": 16, 
+    "acceleration_y": -52, 
+    "acceleration_z": 1024, 
+    "tx_power": 4, 
+    "battery": 2923, 
+    "movement_counter": 122, 
+    "measurement_sequence_number": 8346, 
+    "mac": "c7a020835b87", 
+    "timestamp": 1652560217000000000
+}
